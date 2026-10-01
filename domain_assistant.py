@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
@@ -266,6 +267,71 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY (or OPENAI_API_KEY) is missing from .env")
+        self.api_key = api_key
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        max_attempts = 10
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with httpx.Client(timeout=90.0) as client:
+                    resp = client.post(url, json=payload)
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        if attempt < max_attempts:
+                            wait_sec = 2 ** attempt + 2
+                            if resp.status_code == 429:
+                                m = re.search(r"retry in (\d+(?:\.\d+)?)s", resp.text)
+                                if m:
+                                    wait_sec = int(float(m.group(1))) + 3
+                                else:
+                                    wait_sec = max(60, wait_sec)
+                            else:
+                                wait_sec = min(30, wait_sec)
+                            print(f"\n[Gemini {resp.status_code}] Rate limit / high demand. Waiting {wait_sec}s before retry (attempt {attempt}/{max_attempts})...", flush=True)
+                            time.sleep(wait_sec)
+                            continue
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text}")
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        raise RuntimeError(f"Gemini returned no candidates: {data}")
+                    answer = candidates[0]["content"]["parts"][0]["text"].strip()
+                    if not answer:
+                        raise RuntimeError("Gemini returned an empty answer")
+                    return answer
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt < max_attempts:
+                    wait_sec = min(30, 2 ** attempt + 2)
+                    print(f"\n[Network error] Retrying in {wait_sec}s (attempt {attempt}/{max_attempts})...", flush=True)
+                    time.sleep(wait_sec)
+                    continue
+                raise
+        raise RuntimeError("Gemini failed after maximum retry attempts")
+
+
+def _default_generator() -> TextGenerator:
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if gemini_key or openai_key.startswith("AIza"):
+        return GeminiGenerator()
+    return OpenAIGenerator()
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +365,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _default_generator(),
             top_k,
         )
 
@@ -405,6 +471,18 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    cache_path = Path("artifacts/.answers_cache.json")
+    cached_answers: dict[str, dict[str, Any]] = {}
+    if cache_path.exists():
+        try:
+            raw_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(raw_cache, list):
+                for c in raw_cache:
+                    if isinstance(c, dict) and "id" in c and "actual_answer" in c:
+                        cached_answers[c["id"]] = c
+        except Exception:
+            pass
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
         percentage = index / total
@@ -414,6 +492,17 @@ def generate_actual_answers(
         question_preview = re.sub(r"\s+", " ", item["question"]).strip()
         if len(question_preview) > 58:
             question_preview = f"{question_preview[:55]}..."
+
+        # Check if already in cache
+        if item["id"] in cached_answers:
+            answers.append(cached_answers[item["id"]])
+            filled_after = round(20 * percentage)
+            bar_after = "#" * filled_after + "-" * (20 - filled_after)
+            notify(
+                f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK (cached)"
+            )
+            continue
+
         notify(
             f"[{bar_before}] {completed_before:02d}/{total:02d} | "
             f"{item['id']} generating: {question_preview}"
@@ -424,25 +513,28 @@ def generate_actual_answers(
             response = assistant.answer_with_trace(item["question"])
         except Exception:
             notify(f"FAILED at {item['id']}; stopping the run.")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(answers, ensure_ascii=False, indent=2), encoding="utf-8")
             raise
 
-        answers.append(
-            {
-                "id": item["id"],
-                "question": item["question"],
-                "actual_answer": response.actual_answer,
-                "retrieved_contexts": [
-                    {
-                        "source_doc": chunk.source_doc,
-                        "chunk_id": chunk.chunk_id,
-                        "text": chunk.text,
-                        "score": round(chunk.score, 6),
-                    }
-                    for chunk in response.retrieved_chunks
-                ],
-                "error": None,
-            }
-        )
+        record = {
+            "id": item["id"],
+            "question": item["question"],
+            "actual_answer": response.actual_answer,
+            "retrieved_contexts": [
+                {
+                    "source_doc": chunk.source_doc,
+                    "chunk_id": chunk.chunk_id,
+                    "text": chunk.text,
+                    "score": round(chunk.score, 6),
+                }
+                for chunk in response.retrieved_chunks
+            ],
+            "error": None,
+        }
+        answers.append(record)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(answers, ensure_ascii=False, indent=2), encoding="utf-8")
 
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
@@ -451,6 +543,7 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(1.0)
 
     return {
         "schema_version": "1.0",
